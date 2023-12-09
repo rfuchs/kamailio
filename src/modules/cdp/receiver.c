@@ -71,6 +71,7 @@
 #include "diameter_peer.h"
 
 #include "../../core/cfg/cfg_struct.h"
+#include "../../core/pass_fd.h"
 
 extern dp_config *config; /**< Configuration for this diameter peer 	*/
 extern int method;
@@ -274,175 +275,6 @@ static void drop_serviced_peer(serviced_peer_t *sp, int locked)
 	pkg_free(sp);
 }
 
-
-/**
- * Sends a file descriptor to another process through a pipe, together with a pointer to the peer that it is
- * associated with.
- * @param pipe_fd - pipe to send through
- * @param fd - descriptor to send
- * @param p - peer associated with the descriptor or null if unknown peer
- * @returns 1 on success, 0 on failure
- */
-static int send_fd(int pipe_fd, int fd, peer *p)
-{
-	struct msghdr msg;
-	struct iovec iov[1];
-	int ret;
-	int *tmp = NULL;
-	memset(&msg, 0, sizeof(struct msghdr));
-
-#ifdef HAVE_MSGHDR_MSG_CONTROL
-	struct cmsghdr *cmsg;
-	/* make sure msg_control will point to properly aligned data */
-	union
-	{
-		struct cmsghdr cm;
-		char control[CMSG_SPACE(sizeof(fd))];
-	} control_un;
-
-	msg.msg_control = control_un.control;
-	/* openbsd doesn't like "more space", msg_controllen must not
-	 * include the end padding */
-	msg.msg_controllen = CMSG_LEN(sizeof(fd));
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = SCM_RIGHTS;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
-	tmp = (int *)CMSG_DATA(cmsg);
-	*tmp = fd;
-	msg.msg_flags = 0;
-#else
-	msg.msg_accrights = (caddr_t)&fd;
-	msg.msg_accrightslen = sizeof(fd);
-#endif
-
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-
-	iov[0].iov_base = &p;
-	iov[0].iov_len = sizeof(peer *);
-	msg.msg_iov = iov;
-	msg.msg_iovlen = 1;
-
-again:
-	ret = sendmsg(pipe_fd, &msg, 0);
-	if(ret < 0) {
-		if(errno == EINTR)
-			goto again;
-		if((errno != EAGAIN) && (errno != EWOULDBLOCK)) {
-			LM_CRIT("send_fd: sendmsg failed on %d: %s\n", pipe_fd,
-					strerror(errno));
-			return 0;
-		}
-	}
-
-	return 1;
-}
-
-
-/**
- * Receive a file descriptor from another process
- * @param pipe_fd - pipe to read from
- * @param fd - file descriptor to fill
- * @param p - optional pipe to fill
- * @returns 1 on success or 0 on failure
- */
-static int receive_fd(int pipe_fd, int *fd, peer **p)
-{
-	struct msghdr msg;
-	struct iovec iov[1];
-	int new_fd;
-	int ret;
-	int *tmp = NULL;
-
-#ifdef HAVE_MSGHDR_MSG_CONTROL
-	struct cmsghdr *cmsg;
-	union
-	{
-		struct cmsghdr cm;
-		char control[CMSG_SPACE(sizeof(new_fd))];
-	} control_un;
-
-	memset(&msg, 0, sizeof(struct msghdr));
-	msg.msg_control = control_un.control;
-	msg.msg_controllen = sizeof(control_un.control);
-#else
-	msg.msg_accrights = (caddr_t)&new_fd;
-	msg.msg_accrightslen = sizeof(int);
-#endif
-
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-
-	iov[0].iov_base = p;
-	iov[0].iov_len = sizeof(peer *);
-	msg.msg_iov = iov;
-	msg.msg_iovlen = 1;
-
-again:
-	ret = recvmsg(pipe_fd, &msg, MSG_DONTWAIT | MSG_WAITALL);
-	if(ret < 0) {
-		if(errno == EINTR)
-			goto again;
-		if((errno == EAGAIN) || (errno == EWOULDBLOCK))
-			goto error;
-		LM_CRIT("receive_fd: recvmsg on %d failed: %s\n", pipe_fd,
-				strerror(errno));
-		goto error;
-	}
-	if(ret == 0) {
-		/* EOF */
-		LM_CRIT("receive_fd: EOF on %d\n", pipe_fd);
-		goto error;
-	}
-	if(ret != sizeof(peer *)) {
-		LM_WARN("receive_fd: different number of bytes received than expected "
-				"(%d from %ld)"
-				"trying to fix...\n",
-				ret, (long int)sizeof(peer *));
-		goto error;
-	}
-
-#ifdef HAVE_MSGHDR_MSG_CONTROL
-	cmsg = CMSG_FIRSTHDR(&msg);
-	if((cmsg != 0) && (cmsg->cmsg_len == CMSG_LEN(sizeof(new_fd)))) {
-		if(cmsg->cmsg_type != SCM_RIGHTS) {
-			LM_ERR("receive_fd: msg control type != SCM_RIGHTS\n");
-			goto error;
-		}
-		if(cmsg->cmsg_level != SOL_SOCKET) {
-			LM_ERR("receive_fd: msg level != SOL_SOCKET\n");
-			goto error;
-		}
-		tmp = (int *)CMSG_DATA(cmsg);
-		*fd = *tmp;
-	} else {
-		if(!cmsg)
-			LM_ERR("receive_fd: no descriptor passed, empty control message\n");
-		else
-			LM_ERR("receive_fd: no descriptor passed, cmsg=%p,"
-				   "len=%d\n",
-					cmsg, (unsigned)cmsg->cmsg_len);
-		*fd = -1;
-		*p = 0;
-		/* it's not really an error */
-	}
-#else
-	if(msg.msg_accrightslen == sizeof(int)) {
-		*fd = new_fd;
-	} else {
-		LM_ERR("receive_fd: no descriptor passed,"
-			   " accrightslen=%d\n",
-				msg.msg_accrightslen);
-		*fd = -1;
-	}
-#endif
-
-	return 1;
-error:
-	return 0;
-}
 
 /**
  * Initializes the receiver.
@@ -796,7 +628,8 @@ int receive_loop(peer *original_peer)
 						   "exchange pipe\n");
 					p = 0;
 					fd = -1;
-					if(!receive_fd(fd_exchange_pipe_local, &fd, &p)) {
+					if(!receive_fd(fd_exchange_pipe_local, &p, sizeof(p), &fd,
+							   MSG_DONTWAIT | MSG_WAITALL)) {
 						LM_ERR("select_recv(): Error reading from fd exchange "
 							   "pipe\n");
 					} else {
@@ -1102,7 +935,7 @@ int peer_connect(peer *p)
 		LM_INFO("peer_connect(): Peer %.*s:%d connected\n", p->fqdn.len,
 				p->fqdn.s, p->port);
 
-		if(!send_fd(p->fd_exchange_pipe, sock, p)) {
+		if(!send_fd(p->fd_exchange_pipe, &p, sizeof(p), sock)) {
 			LM_ERR("peer_connect(): [%.*s] Error sending fd to respective "
 				   "receiver\n",
 					p->fqdn.len, p->fqdn.s);
@@ -1139,7 +972,7 @@ int receiver_send_socket(int sock, peer *p)
 	else
 		pipe_fd = fd_exchange_pipe_unknown;
 
-	return send_fd(pipe_fd, sock, p);
+	return send_fd(pipe_fd, &p, sizeof(p), sock);
 }
 
 
@@ -1247,7 +1080,7 @@ int peer_send(peer *p, int sock, AAAMessage *msg, int locked)
 		LM_DBG("peer_send(): [%.*s] switching peer to own and dedicated "
 			   "receiver\n",
 				p->fqdn.len, p->fqdn.s);
-		send_fd(p->fd_exchange_pipe, sock, p);
+		send_fd(p->fd_exchange_pipe, &p, sizeof(p), sock);
 		for(sp = serviced_peers; sp; sp = sp->next)
 			if(sp->p == p) {
 				drop_serviced_peer(sp, locked);
